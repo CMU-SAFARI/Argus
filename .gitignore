@@ -1,0 +1,33 @@
+# Build outputs
+build/
+*.o
+*.skel.h
+
+# Generated files
+src/include/vmlinux.h
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+compile_commands.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+.venv/*
+__pycache__/
+*.pyc
+
+# Benchmarks / results (per-machine measurement data; see ARTIFACT.md packaging note)
+results/*
+
+# agent-authored eBPF code, regenerated per run
+agent_handlers/runs/
+
+# dev transcripts
+full_conversation_*.md

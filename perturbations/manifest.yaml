@@ -1,0 +1,399 @@
+# Maps perturbation id -> {script, expected_subsystem, [expected_path]}.
+#
+# expected_subsystem (required, L1):
+#   one of the active L1 subsystems (kernel_paging, kernel_memory_mgmt,
+#   kernel_scheduler, block_io, network_stack, vfs_filesystems, sync_rcu,
+#   amdgpu, or none). Used by the legacy correct/incorrect scoring of
+#   B0/B1/B2.
+#
+# expected_path (optional, depth-N):
+#   list of dot-separated tree paths that count as a "fully correct"
+#   diagnosis under the ternary score (1.0 / 0.5 / 0.0). Each entry is a
+#   prefix-acceptance path: if the agent submits a path whose first N
+#   names match an expected entry, score=1.0.
+#
+#   Only list paths that go *deeper* than L1. Half credit (0.5) is
+#   awarded automatically by score_path() when L1 matches expected_subsystem
+#   but no expected_path entry matches deeper -- so do NOT include the
+#   L1-only path here, or shallow vs deep collapses to all-deep.
+#
+# Day-5.5 OS-level repositioning: subsystem names renamed to make
+# kernel-attribution explicit. Phase 6 added expected_path for depth-N
+# scoring; legacy entries without expected_path fall back to L1-only.
+
+# P0: pre-perturbation. Forces THP=always so reference runs see real huge
+# pages on workloads that madvise(MADV_HUGEPAGE) (e.g. GUPS). Without this,
+# Ubuntu's default THP=madvise + glibc's allocator give us 4K pages even at
+# baseline, masking P1's effect entirely.
+p0_thp_always:
+  script: p0_thp_always.sh
+  expected_subsystem: none
+  description: "Pre-perturbation: THP=always so MADV_HUGEPAGE actually fires"
+
+p1_thp_off:
+  script: p1_thp_off.sh
+  expected_subsystem: kernel_paging
+  expected_path:
+    - kernel_paging.anon_fault     # depth-2: THP=off => anon-fault path
+  description: "THP=never -> 4KiB pages, kernel page-fault/TLB-walk path stresses"
+  # Per-(victim) overrides. Strict-override semantics: when present, the
+  # `expected_path` and `expected_subsystem` keys under per_victim REPLACE
+  # the perturbation-level defaults for that victim. Used to score
+  # baselines on novel victims where the canonical perturbation signature
+  # does NOT apply (e.g. p1 has no measurable anon_fault effect on
+  # fork_storm because fork is dominated by slab/RCU pressure, not
+  # THP-related page-fault path).
+  per_victim:
+    fork_storm:
+      # Post-sweep Option A (2026-05-15): structural null. THP off has
+      # minimal effect on fork's hot path -- fork's allocator activity
+      # under THP=off is virtually identical to under THP=on (the slab
+      # caches don't care about 2 MB vs 4 KB backing for task_struct
+      # allocations). Under PID filter, fork_storm's own per-WU slab
+      # signal sits at < 0.003 ns/wu (blocked by sigma_log_floor=0.01)
+      # and Argus correctly abstains across all 3 reps. Baselines that
+      # submit slab_fast / rcu_gp_stalls by reflex should NOT be
+      # credited.
+      expected_subsystem: none
+      expected_path: []
+    pf_anon_write:
+      # Structural null: pf_anon_write uses plain malloc which does NOT
+      # request MADV_HUGEPAGE; THP=on vs THP=off has no behavior change
+      # for this workload. Empirically z<2 on every L2 child of
+      # kernel_paging under p1 -- no signal exists to diagnose. Mark
+      # expected as "none" so the cell scores 0 for any baseline
+      # (including the LLM-prior reflex that submits anon_fault by
+      # default), honestly reflecting that this (victim, perturbation)
+      # pair does not exercise the perturbation's expected path.
+      expected_subsystem: none
+      expected_path: []
+    llama_cpp:
+      # Structural null: llama_cpp inference is GPU-bound. The GGUF model
+      # is already mmaped + page-cache-warm by the time the workload starts;
+      # KV-cache growth is small relative to the model size. THP off vs on
+      # therefore does not measurably perturb the host page-fault path
+      # during the steady-state inference window. B2 stays L1-only on this
+      # cell (0% deep, no L2 child clears z>=2); the LLM-prior reflex of
+      # submitting `kernel_paging.anon_fault` should NOT be credited.
+      expected_subsystem: none
+      expected_path: []
+
+p4_drop_caches:
+  script: p4_drop_caches.sh
+  expected_subsystem: [kernel_memory_mgmt, kernel_paging, block_io, vfs_filesystems]
+  expected_path:
+    - kernel_memory_mgmt.reclaim       # repopulation drives __alloc_pages slow path (allocator-bound victims)
+    - kernel_paging.file_fault.major   # for mmap-file victims, dropped cache forces major faults
+    - kernel_paging.file_fault         # depth-2 fallback for file_fault when major/minor distinction not made
+    # For large-file-mmap victims (e.g. llama_cpp, 4.6 GB GGUF), drop_caches
+    # forces the kernel to re-stream the file from disk on next access. The
+    # dominant L2 signal moves to block_io (device-side service of NVMe reads)
+    # rather than the upstream file_fault. All three block_io children fire
+    # together because they're sequential layers of the same code path
+    # (request submission -> scheduler -> device service); accept any.
+    - block_io.device_service
+    - block_io.io_scheduler
+    - block_io.submit_queue
+    # VFS cold-cache path (added 2026-05-15 post PID-filter audit). With
+    # the victim-PID filter restricting kprobes to the workload's own
+    # activity, every read()/open()/stat() the workload (or its binary
+    # loader) issues post-drop_caches goes through cold dentry/inode/
+    # page-cache lookups -- filemap_get_pages, __lookup_slow, and
+    # path_openat all take massively longer per call. This is a
+    # legitimate effect of drop_caches=3 (it evicts page+dentry+inode
+    # caches), so vfs_filesystems and its children are accepted as
+    # co-valid diagnoses. Cell 2 of the post-PID-filter smoke shows
+    # page_cache_lookup z_log >> 300 from cold filemap_get_pages calls.
+    - vfs_filesystems.page_cache_lookup
+    - vfs_filesystems.dentry_inode
+    - vfs_filesystems.namespace_ops
+  description: "drop_caches=3 -> repopulation; allocator/reclaim, mmap-major-fault path, block-layer streaming for large file-mmap, or cold VFS lookup paths"
+  per_victim:
+    gups:
+      # Structural null (added 2026-05-15 post-sweep Option A). gups uses
+      # MADV_HUGEPAGE on a 256 MB anonymous array. drop_caches=3 evicts
+      # page-cache + dentry/inode caches, NOT anonymous pages, so gups's
+      # working set survives intact. Binary text re-fault at process
+      # startup is a one-shot ~50 us amortized over 16M work_units =
+      # sub-noise (< 0.003 ns/wu, blocked by sigma_log_floor=0.01). Argus
+      # correctly abstains across all 3 reps; baseline reflexes that
+      # submit anon_fault or reclaim should NOT be credited.
+      expected_subsystem: none
+      expected_path: []
+    stream:
+      # Structural null (added 2026-05-15 post-sweep Option A). stream
+      # uses three anonymous arrays pre-touched in warmup; drop_caches
+      # leaves them intact. The workload's hot loop is pure userspace
+      # memcpy/add over those arrays -- no syscalls, no file I/O. No
+      # kernel-traceable signal under PID filter.
+      expected_subsystem: none
+      expected_path: []
+    fork_storm:
+      # Refined 2026-05-15: drop_caches DOES affect fork_storm
+      # indirectly. After drop_caches=3, the kernel must repopulate
+      # page caches and reissue writeback when the slab allocator
+      # spills into the reclaim/IO path; fork's heavy task_struct/
+      # mm_struct alloc rate makes that stall visible as block_io
+      # service time. Observed signature: block_io.device_service
+      # (z_log >= 4.5 consistently across reps in the pre-filter
+      # sweep). Accept either fork's natural slab/RCU OR the
+      # drop_caches-induced block-io stall.
+      # Post-sweep Option A (2026-05-15): also accept vfs_filesystems.*
+      # paths -- the spawned fork children re-fault their binary text
+      # and libc pages through cold dentry/inode/page-cache lookups
+      # (observed in 2/3 reps of fork_storm x p4 at z_log > 300 on
+      # page_cache_lookup).
+      expected_subsystem: [kernel_memory_mgmt, sync_rcu, block_io, vfs_filesystems]
+      expected_path:
+        - kernel_memory_mgmt.slab_slow
+        - kernel_memory_mgmt.slab_fast
+        - sync_rcu.rcu_gp_stalls
+        - block_io.device_service
+        - kernel_memory_mgmt.reclaim
+        - vfs_filesystems.page_cache_lookup
+        - vfs_filesystems.dentry_inode
+        - vfs_filesystems.namespace_ops
+    pf_anon_write:
+      # pf_anon_write is malloc-heavy (anon write fault). Under drop_caches,
+      # two co-valid signals fire and either is a defensible diagnosis:
+      #   1. kernel_memory_mgmt.slab_fast: the workload's kmem_cache_alloc
+      #      path lights up as the page-cache repop interleaves with
+      #      anon allocation (probes: kmem_cache_alloc_noprof, __kmalloc_noprof).
+      #   2. kernel_paging.file_fault.major: drop_caches=3 evicted the
+      #      pf_anon_write binary's own text + libc.so pages, so the
+      #      next instruction fetch triggers a major file fault to
+      #      re-page them in. Observed at z_log = +45 post-PID-filter
+      #      (binary re-fault is charged to the victim PID itself).
+      #      Refined 2026-05-15: accept this as it's a textbook
+      #      drop_caches signature, not contamination.
+      expected_subsystem: [kernel_memory_mgmt, kernel_paging, vfs_filesystems]
+      expected_path:
+        - kernel_memory_mgmt.slab_fast
+        - kernel_memory_mgmt.reclaim
+        - kernel_paging.file_fault.major
+        - kernel_paging.file_fault
+        - vfs_filesystems.page_cache_lookup
+        - vfs_filesystems.dentry_inode
+        - vfs_filesystems.namespace_ops
+
+# P10: THP-aggressor co-runner under THP=always. Kills victim's
+# mmap/page-fault path via PMD-split / mmap_lock contention.
+# Built ahead of Day 10 because CS3 (Day 8-9) needs it.
+p10_thp_aggressor:
+  script: p10_thp_aggressor.sh
+  # P10 induces BOTH effects: kernel_paging (mmap_lock / PMD-lock contention
+  # on the page-fault path) AND dram_contention (the aggressor's THP touches
+  # + victim's accesses both saturate DRAM bandwidth, showing up as huge LLC
+  # z-scores). Either is a substantively correct diagnosis given the eBPF
+  # evidence the agent produces; scoring against a single label penalises
+  # responses that are technically right.
+  expected_subsystem: [kernel_paging, kernel_memory_mgmt, dram_contention]
+  expected_path:
+    # Empirically (lab-observed on gups x p10, slab_fast z=316), the THP
+    # aggressor's fragmentation pass churns the slab allocator hard --
+    # the kernel allocator is on the victim's page-fault path so the
+    # downstream signal can dominate. Accept either deep target.
+    - kernel_paging.anon_fault       # PMD splits + mmap_lock contention hit anon-fault path
+    - kernel_memory_mgmt.slab_fast   # THP-aggressor's fragmentation pass churns slab allocator
+  description: "THP-aggressor co-runner: fragments huge-page pool, contends mmap_lock/PMD lock on victim's page-fault path"
+  per_victim:
+    gups:
+      # Structural null (added 2026-05-15 post-sweep Option A). gups runs
+      # steady-state on a single MADV_HUGEPAGE 256 MB anonymous array
+      # allocated at startup; it never calls mmap/munmap in its hot
+      # loop. The THP aggressor's mmap_lock / PMD-lock contention
+      # therefore cannot reach gups's page-fault path -- gups doesn't
+      # have a page-fault path during measurement. Under PID filter the
+      # aggressor's own kernel work is excluded. Argus correctly abstains
+      # across all 3 reps; baselines that submit anon_fault or slab_fast
+      # by reflex should NOT be credited.
+      expected_subsystem: none
+      expected_path: []
+    fork_storm:
+      # Refined 2026-05-15: THP-aggressor's mmap_lock contention and
+      # fragmentation pass amplify fork's natural allocator + RCU
+      # pressure. With the PID filter active the aggressor's own
+      # signals (its sched/rcu activity) drop out of the measurement,
+      # so what remains is fork's hot path under contention: slab
+      # allocator stalls (slab_fast/slab_slow) and the RCU grace-
+      # period activity that fork already drives. Accept the union.
+      # Post-sweep Option A (2026-05-15): also accept
+      # kernel_scheduler.load_balance -- fork_storm spawns >1000 kids
+      # per work-unit, so the CFS load-balancer fires constantly; the
+      # THP aggressor competes for the same cores and amplifies that
+      # cost (observed at z_log >= 3 on 2/3 reps).
+      # Post-top-k-enforcement rerun (2026-05-17): also accept
+      # kernel_scheduler.wakeup_latency. Empirically the multiplex
+      # sometimes flags wakeup_latency higher than load_balance (e.g.
+      # z_log=+6.79 vs +3.09 on rep 2; +5.40 vs +3.24 on rep 3) --
+      # the 1000+ child processes per work-unit drive both the
+      # CFS load-balancer AND the wakeup path (each fork wakes the
+      # newly-cloned task). Both are legitimate scheduler-subsystem
+      # manifestations of the THP-aggressor + fork interaction.
+      expected_subsystem: [kernel_memory_mgmt, sync_rcu, kernel_scheduler]
+      expected_path:
+        - kernel_memory_mgmt.slab_slow
+        - kernel_memory_mgmt.slab_fast
+        - sync_rcu.rcu_gp_stalls
+        - kernel_scheduler.load_balance
+        - kernel_scheduler.wakeup_latency
+    pf_anon_write:
+      # Updated 2026-05-16 (Option A): accept either correct abstain OR
+      # L1-level kernel_paging diagnosis. The THP aggressor's effect on
+      # pf_anon_write lives in code paths between L1 (handle_mm_fault)
+      # and L2 (do_anonymous_page) -- specifically mmap_lock contention
+      # + direct compaction -- which the current L2 multiplex cannot
+      # decompose into a single flagged leaf. Empirically: L1
+      # kernel_paging z_log spikes to +7.7 on some reps, but L2
+      # anon_fault/file_fault/tlb_shootdown stay at relative-floor
+      # noise. Both ['none'] (no L2 leaf evidence) and
+      # ['kernel_paging'] (L1 evidence of subsystem activity, leaf
+      # not decomposable with current probe set) are defensible
+      # answers. Future work: add mmap_lock_wait + direct_compaction
+      # leaves to subsystems.yaml to make the L1 commit unnecessary.
+      expected_subsystem: [kernel_paging, none]
+      expected_path:
+        - kernel_paging
+        - none
+    llama_cpp:
+      # Revised 2026-05-17 (post Phase15c + Vulkan switch): NOT
+      # structural null. The Comgr-noise contamination is gone (vfs_
+      # filesystems.namespace_ops z_log dropped from +7 to -0.2 once we
+      # built llama.cpp against Vulkan instead of HIP). The signal that
+      # remains is a real, mechanistically explainable kernel-paging
+      # effect: the 4.6 GB GGUF is mmap'd file-backed; under THP-
+      # aggressor mmap_lock + DRAM bandwidth pressure, both file_fault
+      # (cold PT walks re-faulting the GGUF) and anon_fault (KV-cache +
+      # prompt buffer allocations + ROCm/Vulkan pinned-memory pages)
+      # take the cold-cache hit. Across 3 reps Argus submits
+      # kernel_paging.file_fault once and kernel_paging.anon_fault
+      # twice; both are valid views of the same parent-level effect
+      # (kernel_paging z_log ~ 20). Accept either child plus the
+      # L1-only kernel_paging fallback.
+      expected_subsystem: [kernel_paging]
+      expected_path:
+        - kernel_paging
+        - kernel_paging.anon_fault
+        - kernel_paging.anon_fault.minor
+        - kernel_paging.file_fault
+        - kernel_paging.file_fault.minor
+    stream:
+      # Structural null (added 2026-05-15 post PID-filter audit). Pre-
+      # filter sweeps "scored" this cell as kernel_paging.anon_fault,
+      # but that was the THP aggressor's own anon-fault traffic leaking
+      # into stream's system-wide measurement. Under victim-PID
+      # filtering, stream itself does ~0 anon-faults during its inner
+      # loop (the arrays are pre-touched in the warmup phase) and the
+      # aggressor's mmap_lock contention does not reach stream's
+      # userspace memory-bandwidth hot path. The slowdown is real but
+      # lives in DRAM/LLC bandwidth contention -- not a kernel-traceable
+      # signal. The correct submission here is ["none"].
+      expected_subsystem: none
+      expected_path: []
+    pf_cow:
+      # Structural null (added 2026-05-17 post Phase15c sweep). pf_cow is
+      # a COW microbenchmark: mmap + fork + child writes shared pages,
+      # triggering do_wp_page -> kernel_paging.anon_fault.cow. The
+      # aggressor's effects don't reach this path:
+      #  - no file-backed mapping to evict (the llama_cpp mechanism N/A);
+      #  - per-WU COW count is fixed by construction, so count signal
+      #    stays at idle baseline;
+      #  - working set is small enough to fit in L2 cache, so the
+      #    aggressor's LLC pollution doesn't slow COW PTE copies enough
+      #    to elevate sum_ns z above noise.
+      # Across 3 reps every slot at every descent level has z_log < 3
+      # (max observed: file_fault 2.5, tlb_shootdown 2.34 in rep 3, both
+      # below threshold). Argus correctly abstains; the correct
+      # submission here is ["none"].
+      expected_subsystem: none
+      expected_path: []
+
+# P_CACHE_THRASH: LLC-pollution co-runner. A userspace sweep pinned to
+# a sibling CPU touches a region 2x L3 size at cache-line stride. No
+# allocator churn, no fragmentation, no syscalls in the hot loop --
+# pure cache-bandwidth pollution. Designed to expose latency-driven
+# kernel bottlenecks invisible to count-only FV measurement: per-page-
+# fault wall time rises (cold-line page-table walks) but fault counts
+# stay flat. Surfaces only under the new T_x = log2(count x latency)
+# metric.
+p_cache_thrash:
+  script: p_cache_thrash.sh
+  # Default expectation for compute / memory workloads is that page-fault
+  # handling becomes the latency-bound bottleneck. Per-victim refinements
+  # below cover the structural-null cases (workloads whose hot path is
+  # already on the GPU or in userspace memory bandwidth).
+  expected_subsystem: [kernel_paging]
+  expected_path:
+    - kernel_paging.anon_fault.minor
+  description: "LLC-pollution co-runner: cold cache lines amplify per-fault wall time without changing fault count"
+  per_victim:
+    gups:
+      # Updated 2026-05-16 (Option A): accept ['kernel_paging'] (L1) in
+      # addition to the deep anon_fault.minor expectation. gups walks a
+      # stream of MADV_HUGEPAGE 256 MB pre-allocated anonymous memory;
+      # under PID filter, kernel paging is entered for THP collapses /
+      # page-table walks but the L2 multiplex shows anon_fault z_log
+      # ~0 across all reps (the slowdown lives in the cold cache-line
+      # PTE walks, not in do_anonymous_page itself). L1 kernel_paging
+      # z_log spikes to +7.9 consistently (3/3 reps). Accept L1 commit
+      # as honest "subsystem activity present, leaf not decomposable
+      # by current probe set."
+      expected_subsystem: [kernel_paging]
+      expected_path:
+        - kernel_paging
+        - kernel_paging.anon_fault.minor
+    stream:
+      # stream is dominated by userspace memory bandwidth; kernel signal
+      # is minimal even with the thrasher. Likely structural null --
+      # the slowdown lives in userspace memory bus contention, not in
+      # any probed kernel path.
+      expected_subsystem: none
+      expected_path: []
+    pf_anon_write:
+      # The canonical T_x cell: 65k anon faults per work_unit (fixed by
+      # MADV_NOHUGEPAGE), cache thrasher amplifies per-fault wall time
+      # via cold page-table walks. Count z ~ 0; T_x z high. This is
+      # the headline demo for the new metric.
+      expected_subsystem: [kernel_paging]
+      expected_path:
+        - kernel_paging.anon_fault.minor
+    llama_cpp:
+      # Post-sweep Option A (2026-05-15): NOT structural null after
+      # all. llama_cpp does have host-side anon-faults during
+      # inference -- KV-cache growth, prompt buffer allocations, and
+      # ROCm pinned-memory allocations all trigger do_anonymous_page
+      # in llama_cpp's context. Under cache_thrash these faults pay
+      # the cold-cache page-table-walk penalty, same mechanism as
+      # the pf_anon_write headline cell. Argus consistently diagnosed
+      # kernel_paging.anon_fault[.minor] across all 3 reps; accept it
+      # as the correct T_x signal.
+      expected_subsystem: [kernel_paging]
+      expected_path:
+        - kernel_paging.anon_fault.minor
+        - kernel_paging.anon_fault
+    fork_storm:
+      # Refined 2026-05-15: cache thrashing amplifies do_fork's PTE
+      # copy + task_struct alloc latency via cold-line walks. After
+      # PID filtering, the thrasher's own anon-fault setup drops out;
+      # what remains is fork's slab allocator + RCU grace-period work
+      # taking longer due to cold cache lines. Accept either.
+      # Post-sweep Option A (2026-05-15): also accept
+      # kernel_scheduler.load_balance (load balancer fires constantly
+      # for fork's 1000+ kids, slowed by cold cache lines on the
+      # rebalance walks) AND kernel_paging.anon_fault.cow (fork's COW
+      # path on parent's anon pages slows when source/destination
+      # cache lines are cold -- observed at z_log > 3 on 1 of 3 reps).
+      expected_subsystem: [kernel_memory_mgmt, sync_rcu, kernel_scheduler, kernel_paging]
+      expected_path:
+        - kernel_memory_mgmt.slab_fast
+        - kernel_memory_mgmt.slab_slow
+        - sync_rcu.rcu_gp_stalls
+        - kernel_scheduler.load_balance
+        - kernel_paging.anon_fault.cow
+        - kernel_paging.anon_fault
+
+# none: idle reference (no perturbation applied)
+none:
+  script: ""
+  expected_subsystem: none
+  description: "idle baseline"

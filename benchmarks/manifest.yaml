@@ -1,0 +1,110 @@
+# Benchmark (victim) registry. Each entry maps a benchmark id to the binary
+# the harness runs and the regex that extracts its work-unit count.
+#
+# Apples-to-apples principle: invoke with a fixed --iterations (not a fixed
+# duration) so every run does the same amount of work and counter values are
+# directly comparable across (perturbation, repetition) pairs.
+#
+# Field semantics:
+#   binary, args, work_units_pattern  -- LOAD-BEARING. Used by reference.py
+#       and the sweep CLI to invoke the benchmark and parse its stdout.
+#   description                       -- LOAD-BEARING for paper figures and
+#       human-readable logs.
+#   expected_dominant                 -- DOCUMENTATION ONLY. No code reads it.
+#       A written prediction of which feature-vector slots the benchmark was
+#       designed to stress; useful as a sanity check after building a
+#       reference (compare predicted vs measured mu).
+#   pre_perturbation                  -- LOAD-BEARING. Applied before BOTH the
+#       reference and the measurement runs (see gups/stream).
+#
+# Paper roles: gups, stream, pf_anon_write, llama_cpp, fork_storm are the five
+# victims in the hallucination/TtD matrix (Fig 1, 2) and Case Study 1 (Fig 6).
+# pf_anon_write, pf_cow, pf_major, pf_page_cache, pf_zero_page are the five
+# page-fault perturbers in Case Study 2 (Fig 7). pf_anon_write also drives the
+# overhead microbenchmark (Fig 5).
+
+stream:
+  binary: stream_bench
+  args: ["--iterations", "8", "--array-mib", "256"]
+  description: "McCalpin STREAM kernels - LLC + memory controller pressure"
+  expected_dominant: [llc_load_misses, cache_misses]
+  work_units_pattern: "work_units=([0-9]+)"
+  # Pre-perturbation forces THP=always so that, under P10 (the THP aggressor,
+  # which presumes a real huge-page pool to fragment), the reference and the
+  # measurement differ in one variable instead of two. Same rationale as gups.
+  pre_perturbation: p0_thp_always
+
+gups:
+  binary: gups
+  args: ["--array-mib", "256", "--iterations", "2", "--updates-per-iter", "16000000"]
+  description: "Random-access pointer chase. dTLB + LLC + memory latency."
+  expected_dominant: [dtlb_load_misses, dtlb_store_misses, llc_load_misses]
+  work_units_pattern: "work_units=([0-9]+)"
+  # Applied before BOTH reference and measurement runs so that `none` and
+  # `p1_thp_off` differ only in P1's effect (not in whether THP was even
+  # available). Without it, Ubuntu's default THP=madvise + glibc deliver 4K
+  # pages everywhere and P1 has nothing to flip.
+  pre_perturbation: p0_thp_always
+
+# LLM inference via llama.cpp. work_units = total tokens generated. The 4.6 GB
+# GGUF model is mmap'd file-backed, so under memory pressure the host kernel
+# sees page-cache eviction (file_fault) while KV-cache growth drives anonymous
+# faults (anon_fault) -- the non-obvious kernel-paging signal in Case Study 1.
+llama_cpp:
+  binary: llama_run.sh
+  args: []
+  description: "LLM inference via llama.cpp (8B Q4_K_M GGUF, mmap file-backed)"
+  expected_dominant: [page_faults, kmem_alloc_rate, llc_load_misses]
+  work_units_pattern: "work_units=([0-9]+)"
+
+# Page-fault victim suite. Each microbenchmark is crafted to dominantly produce
+# a single fault type. They wrap a shared C binary
+# (benchmarks/pf_types/minor_page_fault_types) lifted from the legacy
+# dynamic-profiler-ebpf repo. work_units = pages mapped = PF_SIZE_MB * 256
+# (4 KiB pages per MiB), held constant via the PF_SIZE_MB env var (default 256),
+# so per-work-unit fault rates are apples-to-apples across fault types.
+pf_anon_write:
+  binary: run.sh
+  args: []
+  description: "PF-type victim: anonymous write fault (demand-zero + alloc)"
+  expected_dominant: [page_faults, kmem_alloc]
+  work_units_pattern: "work_units=([0-9]+)"
+
+pf_zero_page:
+  binary: run.sh
+  args: []
+  description: "PF-type victim: anonymous read fault (shared zero page, no alloc)"
+  expected_dominant: [page_faults]
+  work_units_pattern: "work_units=([0-9]+)"
+
+pf_cow:
+  binary: run.sh
+  args: []
+  description: "PF-type victim: copy-on-write via fork (prefault N + N COW)"
+  expected_dominant: [page_faults, kmem_alloc]
+  work_units_pattern: "work_units=([0-9]+)"
+
+pf_page_cache:
+  binary: run.sh
+  args: []
+  description: "PF-type victim: file minor fault (mmap of page-cache-resident file)"
+  expected_dominant: [page_faults]
+  work_units_pattern: "work_units=([0-9]+)"
+
+pf_major:
+  binary: run.sh
+  args: []
+  description: "PF-type victim: file major fault (drop_caches + mmap+read)"
+  expected_dominant: [page_faults, block_rq_complete]
+  work_units_pattern: "work_units=([0-9]+)"
+
+# Spawns N short-lived child processes per iteration (N x ITERS total forks).
+# Measured hot path: sync_rcu (PID allocation, task_struct free via call_rcu)
+# + the slab allocator (task_struct alloc). A victim whose LLM prior
+# ("scheduler") differs from its measured kernel path.
+fork_storm:
+  binary: run.sh
+  args: []
+  description: "Fork storm: 20000 short-lived child processes (PID alloc + RCU + task_struct slab)"
+  expected_dominant: [sched_process_fork, kmem_alloc, rcu_utilization, sched_switch]
+  work_units_pattern: "work_units=([0-9]+)"

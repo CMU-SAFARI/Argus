@@ -1,0 +1,275 @@
+# Static L1->L2->L3 subsystem tree (the paper's Fig 4). The agent may only name
+# code paths that appear here. See docs/MECHANISM.md for how it is used.
+#
+# Schema:
+#   subsystems:
+#     - name: <L1 name>           # must match orchestrator/agentctl/detector.SUBSYSTEMS
+#       max_depth: 1 | 2 | 3      # how deep the tree goes for this subsystem
+#       capability: <token>       # 'always' or a token detected by capability.py
+#       description: <text>       # one-line summary, shown in agent prompts
+#       children:                 # L2 children (omit if max_depth=1)
+#         - name: <L2 name>
+#           probes: [<target>, ...]  # multiplexed-probe attachment targets
+#           description: <text>
+#           microbenchmark: <name>   # set when this L2 is a leaf (max_depth=2)
+#           children:                # L3 grandchildren (omit if leaf at L2)
+#             - name: <L3 name>
+#               probes: [<target>, ...]
+#               description: <text>
+#               microbenchmark: <name>
+#
+# Probe target format:
+#   - bare symbol  (e.g. `do_anonymous_page`) attaches as kprobe on that symbol.
+#                  The symbol must be in /proc/kallsyms on the running kernel.
+#   - 'tp:<cat>/<name>'  attaches as a tracepoint (e.g. 'tp:vmscan/mm_vmscan_lru_shrink_inactive').
+#                        The tracepoint must be exposed at /sys/kernel/tracing/events/<cat>/<name>/.
+# Use tracepoints when the kprobe target is inlined-out / static / unstable across kernel versions.
+#
+# A node with no `children` is a leaf. Leaves should declare `microbenchmark`
+# so end-to-end ground truth is well-defined; non-leaves do not.
+#
+# Capability tokens:
+#   - always : present on every host
+#   - amdgpu : detected by capability.detect_capabilities() via /sys/class/drm
+#              + amdgpu:amdgpu_iv tracepoint presence (Phase15b: was
+#              amdgpu_cs_ioctl, swapped because ROCm 7.x bypasses it via
+#              userspace doorbells; amdgpu_iv catches completion IRQs)
+
+subsystems:
+
+  # =========================================================================
+  - name: kernel_paging
+    max_depth: 3
+    capability: always
+    representative_probe: handle_mm_fault    # top-level entry for every page fault (anon/file/cow/major/minor)
+    description: "Page-fault entry path, TLB pressure, TLB shootdown, mmap/munmap."
+    children:
+      - name: anon_fault
+        probes: [do_anonymous_page, wp_page_copy]
+        description: "Anonymous-memory faults: demand-zero, COW, THP collapse."
+        children:
+          - name: minor
+            probes: [do_anonymous_page]
+            description: "Demand-zero anonymous fault under no memory pressure."
+            microbenchmark: pf_anon_minor
+          - name: cow
+            probes: [wp_page_copy]
+            description: "Copy-on-write on a write to an inherited anon page."
+            microbenchmark: pf_anon_cow
+          - name: thp_collapse
+            probes: [collapse_huge_page, "tp:huge_memory/mm_collapse_huge_page"]
+            description: "khugepaged collapsing 4K pages into a 2M THP. khugepaged_scan_mm_slot is inlined on this kernel; we proxy via the tracepoint."
+            microbenchmark: pf_anon_thp_collapse
+      - name: file_fault
+        probes: [filemap_fault, do_read_fault]
+        description: "File-backed page faults via mmap'd files."
+        children:
+          - name: minor
+            probes: [filemap_fault]
+            description: "File fault hitting page cache without disk I/O."
+            microbenchmark: pf_file_minor
+          - name: major
+            probes: [filemap_fault, submit_bio]
+            description: "File fault forcing a disk read via submit_bio."
+            microbenchmark: pf_file_major
+      - name: swap_in
+        probes: [do_swap_page, swap_read_folio]
+        description: "Swap-in path: cgroup-driven eviction + refault. swap_readpage was renamed to swap_read_folio in the folio refactor."
+        microbenchmark: pf_swap_refault
+      - name: tlb_shootdown
+        probes: [flush_tlb_mm_range, native_flush_tlb_multi]
+        description: "Multi-thread mprotect storm forcing IPI-based TLB flush. native_flush_tlb_others was renamed to native_flush_tlb_multi."
+        microbenchmark: pf_tlb_shootdown
+
+  # =========================================================================
+  - name: kernel_memory_mgmt
+    max_depth: 3
+    capability: always
+    representative_probe: __alloc_pages_noprof   # core buddy-allocator entry; covers reclaim slowpath, slab refill, vmalloc backing
+    description: "Page allocator, slab, vmalloc, reclaim/kswapd."
+    children:
+      - name: slab_fast
+        probes: [kmem_cache_alloc_noprof, __kmalloc_noprof]
+        description: "Slab allocator fast path (per-CPU partial hit)."
+        children:
+          - name: kmalloc
+            probes: [__kmalloc_noprof]
+            description: "Tight kmalloc loop on small sizes via socket/close churn. kmalloc_trace_noprof is heavily inlined; __kmalloc_noprof is the canonical entry."
+            microbenchmark: mm_kmalloc_socket
+          - name: kmem_cache
+            probes: [kmem_cache_alloc_noprof]
+            description: "Named slab caches via dentry-cache stress (stat() unique paths)."
+            microbenchmark: mm_dentry_stress
+      - name: slab_slow
+        probes: [___slab_alloc, new_slab]
+        description: "Slab allocator slow path: refill from buddy / cross-node."
+        children:
+          - name: refill_local
+            probes: [new_slab]
+            description: "new_slab on local NUMA node; allocation rate exceeds partial-list capacity."
+            microbenchmark: mm_slab_refill_local
+          - name: refill_remote
+            probes: [new_slab]
+            description: "Cross-node slab refill (cgroup-pinned allocator on different node from CPU)."
+            microbenchmark: mm_slab_refill_remote
+      - name: vmalloc
+        probes: [__vmalloc_node_range_noprof, vmap]
+        description: "vmalloc: kernel-module load/unload triggers vmalloc for module text. Renamed to __vmalloc_node_range_noprof in the alloc-profiling refactor."
+        microbenchmark: mm_vmalloc_module
+      - name: reclaim
+        probes: [__alloc_pages_noprof, try_to_free_pages, "tp:vmscan/mm_vmscan_lru_shrink_inactive"]
+        description: "Reclaim path: kswapd-async vs direct-reclaim spike."
+        children:
+          - name: kswapd
+            probes: ["tp:vmscan/mm_vmscan_lru_shrink_inactive"]
+            description: "Asynchronous reclaim via kswapd. shrink_page_list is inlined; we proxy via the LRU-shrink tracepoint, which fires inside reclaim regardless of caller."
+            microbenchmark: mm_reclaim_kswapd
+          - name: direct
+            probes: [__alloc_pages_noprof, try_to_free_pages]
+            description: "Synchronous reclaim: spike allocation overruns kswapd. __alloc_pages_slowpath was inlined; __alloc_pages_noprof is the entry point that goes into the slow path on failure."
+            microbenchmark: mm_reclaim_direct
+
+  # =========================================================================
+  - name: kernel_scheduler
+    max_depth: 2
+    capability: always
+    representative_probe: try_to_wake_up    # wake-up entry; covers futex / IPI / wait_queue paths. __schedule is kprobe-blacklisted (__notrace).
+    description: "CFS runqueue, wakeup latency, preemption, load balance."
+    children:
+      - name: wakeup_latency
+        probes: [try_to_wake_up]
+        description: "Futex ping-pong between two pinned threads."
+        microbenchmark: sched_futex_pingpong
+      - name: preemption
+        probes: ["tp:sched/sched_switch"]
+        description: "Oversubscribed CPU-bound spin loop (more threads than cores). __schedule is __notrace (kprobe-blacklisted to avoid recursing through the kprobe trampoline's own scheduler call); we use the sched_switch tracepoint, which fires inside __schedule on every context switch."
+        microbenchmark: sched_oversubscribe
+      - name: load_balance
+        probes: ["tp:sched/sched_migrate_task", sched_balance_trigger]
+        description: "Two-NUMA-node migration (threads on node 0, allowed to migrate). load_balance is file-static and not in kallsyms; we use the sched_migrate_task tracepoint + sched_balance_trigger entry."
+        microbenchmark: sched_numa_migrate
+      - name: idle_nohz
+        probes: [tick_nohz_idle_enter, tick_nohz_idle_exit]
+        description: "Idle interleaved with brief wakeups to exercise nohz transitions."
+        microbenchmark: sched_idle_nohz
+
+  # =========================================================================
+  - name: block_io
+    max_depth: 2
+    capability: always
+    representative_probe: submit_bio        # top-level block-layer entry; everything below (mq submit, device service, writeback) passes through.
+    description: "Block-layer request submission, queueing, device service, writeback."
+    children:
+      - name: submit_queue
+        probes: [blk_mq_submit_bio, "tp:block/block_rq_insert"]
+        description: "High-IOPS small pwrite to NVMe. blk_mq_sched_insert_request is inlined; the block_rq_insert tracepoint is the canonical signal for queue insertion."
+        microbenchmark: blk_pwrite_iops
+      - name: device_service
+        probes: [blk_mq_start_request, blk_mq_complete_request]
+        description: "Large sequential read forcing device-side queueing."
+        microbenchmark: blk_seq_read
+      - name: io_scheduler
+        probes: ["tp:block/block_rq_issue", "tp:block/block_rq_complete"]
+        description: "Mixed read/write at different priorities. mq-deadline (dd_*) functions are file-static; we use block_rq_issue + block_rq_complete tracepoints to time issue->complete latency."
+        microbenchmark: blk_mixed_priority
+      - name: writeback
+        probes: [wb_workfn, __writeback_single_inode]
+        description: "Bulk dirty + sync storm."
+        microbenchmark: blk_writeback_sync
+
+  # =========================================================================
+  - name: network_stack
+    max_depth: 2
+    capability: always
+    representative_probe: tcp_sendmsg       # outbound socket entry; covers protocol_stack + socket_copy. RX path is NAPI-softirq, hard to kprobe cleanly per-victim.
+    description: "RX softirq, TX qdisc, protocol stack, socket-layer copy."
+    children:
+      - name: rx_softirq
+        probes: [__napi_poll, net_rx_action]
+        description: "UDP flood receiver with SO_BUSY_POLL off."
+        microbenchmark: net_rx_udp_flood
+      - name: tx_qdisc
+        probes: [__dev_queue_xmit, "tp:qdisc/qdisc_dequeue"]
+        description: "TCP saturation through tc-htb shaper. qdisc_dequeue function is inlined; we use the tracepoint."
+        microbenchmark: net_tx_tcp_sat
+      - name: protocol_stack
+        probes: [tcp_v4_rcv, ip_rcv, tcp_recvmsg]
+        description: "Many small TCP connections (SYN/ACK/FIN heavy)."
+        microbenchmark: net_tcp_short_conns
+      - name: socket_copy
+        probes: [tcp_recvmsg, tcp_sendmsg]
+        description: "Large-message zero-copy off, force per-byte copy."
+        microbenchmark: net_socket_copy
+
+  # =========================================================================
+  - name: vfs_filesystems
+    max_depth: 2
+    capability: always
+    representative_probe: vfs_read          # canonical read syscall entry; dentry/inode lookups + page-cache hits cascade from here.
+    description: "VFS read/write syscall path, dentry/inode cache, fsync, namespace ops."
+    children:
+      - name: page_cache_lookup
+        probes: [filemap_get_pages]
+        description: "read() syscall over warm vs cold file. Disjointness rule with kernel_paging.file_fault: VFS owns syscall path (read/write), paging owns fault path (mmap+touch)."
+        microbenchmark: vfs_read_warm_vs_cold
+      - name: dentry_inode
+        probes: [__lookup_slow, d_lookup]
+        description: "stat() of millions of distinct paths under one directory."
+        microbenchmark: vfs_dentry_stress
+      - name: writeback
+        probes: [vfs_fsync_range, __writeback_single_inode]
+        description: "App-driven fsync storm."
+        microbenchmark: vfs_fsync_storm
+      - name: namespace_ops
+        probes: [path_openat, vfs_unlink, vfs_rename]
+        description: "Tight creat/unlink loop in tmpfs."
+        microbenchmark: vfs_create_unlink_loop
+
+  # =========================================================================
+  - name: sync_rcu
+    max_depth: 2
+    capability: always
+    representative_probe: __mutex_lock_slowpath   # fires only under real contention; idle reference is near-zero, perturbed bursts stand out.
+    description: "RCU grace-period activity, mutex/rwsem contention. Spinlock fast-path is not instrumentable without static-key hacks; this subsystem covers the slowpath only."
+    children:
+      - name: mutex_contention
+        probes: [__mutex_lock_slowpath]
+        description: "N threads contending on a single pthread_mutex."
+        microbenchmark: sync_mutex_contend
+      - name: rwsem_contention
+        probes: [rwsem_down_read_slowpath, rwsem_down_write_slowpath]
+        description: "Many readers + occasional writer on mmap_lock via concurrent mmap."
+        microbenchmark: sync_rwsem_mmap
+      - name: rcu_gp_stalls
+        probes: [rcu_sched_clock_irq, rcu_gp_kthread]
+        description: "Heavy RCU read-side activity in dcache lookup storm."
+        microbenchmark: sync_rcu_dcache_storm
+
+  # =========================================================================
+  - name: amdgpu
+    max_depth: 2
+    capability: amdgpu
+    description: "HIP command submission, dma-fence wait, IOMMU, KFD queue management. AMD-specific; gated off when /sys/class/drm/card*/device/vendor != 0x1002."
+    children:
+      - name: cs_submit
+        probes: [amdgpu_cs_ioctl]
+        description: "Tight HIP launch loop. NOTE (Phase15b): amdgpu_cs_ioctl
+          fires for legacy graphics command submission but is bypassed for
+          ROCm 7.x compute workloads via userspace doorbells; this leaf will
+          rarely fire under HIP/ROCm. The L1 amdgpu signal comes from the FV
+          slot (amdgpu_iv -- completion IRQs), which IS kernel-visible. This
+          leaf is retained for graphics workloads and as a placeholder for
+          future kprobe replacements."
+        microbenchmark: amdgpu_cs_launch_loop
+      - name: dma_fence_wait
+        probes: [dma_fence_wait_timeout]
+        description: "Sync-heavy multi-stream HIP workload."
+        microbenchmark: amdgpu_fence_wait
+      - name: iommu_map
+        probes: ["tp:amdgpu/amdgpu_vm_bo_map", "tp:amdgpu/amdgpu_vm_bo_unmap"]
+        description: "Large-buffer hipMalloc/hipFree churn forcing IOMMU map updates. amd_iommu_map_pages is inlined; we use amdgpu's VM BO map/unmap tracepoints which are the closest userspace-visible signal."
+        microbenchmark: amdgpu_iommu_churn
+      - name: kfd_queue_mgmt
+        probes: ["tp:amdgpu/amdgpu_sched_run_job"]
+        description: "Many short-lived HIP streams. kfd_create_queue / kfd_destroy_queue are not exported by amdkfd on this kernel; we use amdgpu_sched_run_job (per-job submission) as the queue-activity proxy."
+        microbenchmark: amdgpu_kfd_stream_churn

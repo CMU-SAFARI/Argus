@@ -1,0 +1,26 @@
+# AgenticBPF Python dependencies.
+# Reproduce a known-good environment with:
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# Versions pinned to floors that match what was used during artifact
+# development (Day 6, 2026-04-28). Upper bounds avoided to allow
+# Gemini API behavior fixes via SDK upgrades.
+
+# B2 ReAct agent (production default: Google Gemini via google-genai SDK).
+# Provides genai.Client + types.* used by orchestrator/agentctl/chat_backend.py.
+google-genai>=1.73
+
+# Manifest parsing (benchmarks/manifest.yaml, perturbations/manifest.yaml).
+PyYAML>=6.0
+
+# Optional B2 backends. Each is lazy-imported by chat_backend.py only when
+# the user selects that backend; debug-mode (Ollama) uses the openai SDK
+# pointed at http://localhost:11434/v1.
+openai>=1.50         # AGENTICBPF_AGENT_BACKEND=ollama OR =openai
+anthropic>=0.40      # AGENTICBPF_AGENT_BACKEND=anthropic
+
+# Day 12 plotting (paper/plot_sweep.py reads results/sweeps/*.json).
+matplotlib>=3.7
+numpy>=1.24
